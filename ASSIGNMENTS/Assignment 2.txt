@@ -1,0 +1,508 @@
+"""
+DAY 4 DESIGN CHALLENGE – Python Solutions Q1 to Q7
+Run with: python day4_design_challenge.py
+
+The program uses sample inputs so it can run without asking for keyboard input.
+Timing values depend on your computer and Python version.
+"""
+
+import time
+import sys
+from functools import lru_cache
+
+
+# ============================================================
+# Q1 – DECISIONS WITH MANY BOUNDARIES
+# ============================================================
+
+def subsidy_separate_if(units, ration_card, elderly_member):
+    """Intentionally demonstrates independent if statements."""
+    decisions = []
+    if units <= 100:
+        decisions.append("FULL subsidy")
+    if 101 <= units <= 200 and ration_card:
+        decisions.append("PARTIAL subsidy")
+    if units > 200 and elderly_member:
+        decisions.append("SPECIAL subsidy")
+    if not decisions:
+        decisions.append("NO subsidy")
+    return decisions
+
+
+def subsidy_elif(units, ration_card, elderly_member):
+    """Exactly one decision is selected."""
+    if units <= 100:
+        return "FULL subsidy"
+    elif 101 <= units <= 200:
+        if ration_card:
+            return "PARTIAL subsidy"
+        else:
+            return "NO subsidy"
+    elif units > 200:
+        if elderly_member:
+            return "SPECIAL subsidy"
+        else:
+            return "NO subsidy"
+
+
+def q1():
+    print("\n" + "=" * 65)
+    print("Q1 – SUBSIDY ELIGIBILITY")
+    print("=" * 65)
+    households = [
+        ("H1", 99, False, False),
+        ("H2", 100, True, False),       # boundary
+        ("H3", 101, True, False),       # boundary
+        ("H4", 150, False, False),
+        ("H5", 200, True, False),       # boundary
+        ("H6", 201, False, False),      # boundary
+        ("H7", 250, False, True),
+        ("H8", 180, True, True),
+    ]
+    print("Predictions are based on the rules before execution.")
+    print(f"{'House':<7}{'Units':<8}{'Card':<8}{'80+':<7}{'Separate if':<30}{'if-elif-else'}")
+    for name, units, card, elderly in households:
+        separate = subsidy_separate_if(units, card, elderly)
+        chained = subsidy_elif(units, card, elderly)
+        print(f"{name:<7}{units:<8}{str(card):<8}{str(elderly):<7}{str(separate):<30}{chained}")
+
+    # Show how independent if statements can produce two results
+    # when conditions overlap due to a poorly written rule.
+    def faulty_overlapping_rules(units):
+        result = []
+        if units <= 100:
+            result.append("FULL")
+        if units <= 200:  # overlaps with the first condition
+            result.append("PARTIAL")
+        return result
+
+    print("Overlapping-rule example at 80 units:", faulty_overlapping_rules(80))
+    print("Design choice: use if-elif-else for mutually exclusive slabs.")
+    print("Nested if clearly handles the extra card/elderly conditions.")
+    print("Combined Boolean conditions are useful for short, simple checks.")
+
+    # Alternative: match-case (Python 3.10+)
+    def subsidy_match(units, card, elderly):
+        match units:
+            case n if n <= 100:
+                return "FULL subsidy"
+            case n if 101 <= n <= 200 and card:
+                return "PARTIAL subsidy"
+            case n if 101 <= n <= 200:
+                return "NO subsidy"
+            case n if n > 200 and elderly:
+                return "SPECIAL subsidy"
+            case _:
+                return "NO subsidy"
+
+    print("match-case example, 150 units with card:",
+          subsidy_match(150, True, False))
+    print("Complexity: checking k slabs is O(k) worst case and O(1) extra space.")
+    print("A fixed number of if/elif or match cases is O(1) with respect to input size.")
+
+
+# ============================================================
+# Q2 – LOOPS THAT COUNT ATTEMPTS
+# ============================================================
+
+def otp_while(correct_otp, entries):
+    attempts = 0
+    index = 0
+    locked = False
+    while attempts < 3 and index < len(entries):
+        entered = entries[index]
+        index += 1
+        if entered == "":
+            print("Blank entry: continue (not counted).")
+            continue
+        attempts += 1
+        if entered == correct_otp:
+            print("OTP correct: break.")
+            break
+        print("Wrong OTP.")
+    else:
+        # while-else runs when the condition becomes false, not after break.
+        if attempts == 3:
+            locked = True
+            print("Account locked for 30 minutes.")
+    return attempts, locked
+
+
+def otp_for(correct_otp, entries):
+    attempts = 0
+    index = 0
+    locked = False
+    for _ in range(3):
+        # Skip blank entries without using one of the three attempts.
+        while index < len(entries) and entries[index] == "":
+            print("Blank entry: continue (not counted).")
+            index += 1
+        if index >= len(entries):
+            pass  # No more supplied entries; pass is a no-operation placeholder.
+            break
+        entered = entries[index]
+        index += 1
+        attempts += 1
+        if entered == correct_otp:
+            print("OTP correct: break.")
+            break
+        print("Wrong OTP.")
+    else:
+        locked = True
+        print("Loop else: account locked for 30 minutes.")
+    return attempts, locked
+
+
+def otp_with_security(correct_otp, entries, security_answer, expected_answer):
+    """Three normal attempts; two additional attempts after correct security answer."""
+    max_attempts = 3
+    if security_answer.strip().lower() == expected_answer.strip().lower():
+        max_attempts += 2
+    attempts = 0
+    for entered in entries:
+        if attempts >= max_attempts:
+            break
+        if entered == "":
+            continue
+        attempts += 1
+        if entered == correct_otp:
+            print("OTP correct.")
+            break
+    else:
+        if attempts >= max_attempts:
+            print("Account locked for 30 minutes.")
+    return attempts
+
+
+def q2():
+    print("\n" + "=" * 65)
+    print("Q2 – OTP ATTEMPT LOOPS")
+    print("=" * 65)
+    print("while loop demonstration:")
+    print("Attempts, locked =", otp_while("4821", ["", "1111", "2222", "3333"]))
+    print("for range(3) demonstration:")
+    print("Attempts, locked =", otp_for("4821", ["", "1111", "2222", "3333"]))
+    print("Security question correct; extra attempts:")
+    print("Attempts used =", otp_with_security(
+        "4821", ["1111", "2222", "3333", "4444", "4821"],
+        "blue", "blue"))
+    print("while is natural when the number of attempts may change dynamically.")
+    print("Update the counter only after a non-blank entry; otherwise blank entries")
+    print("may use attempts, or failing to update it may create an infinite loop.")
+    print("break exits on success; continue skips a blank entry; pass does nothing.")
+    print("Loop else runs only when the loop finishes without break.")
+    print("Recursion alternative: one function call per attempt; time O(a),")
+    print("recursive stack O(a), while/for loop stack O(1).")
+
+
+# ============================================================
+# Q3 – VEHICLE REGISTRATION VALIDATOR
+# ============================================================
+
+def normalise(text):
+    """Remove spaces/hyphens and convert to uppercase."""
+    return text.strip().replace(" ", "").replace("-", "").upper()
+
+
+def is_valid(reg):
+    """Valid: LLDD(L or LL)DDDD."""
+    if len(reg) not in (9, 10):
+        return False
+    if not reg[0:2].isalpha():
+        return False
+    if not reg[2:4].isdigit():
+        return False
+    if len(reg) == 9:
+        if not reg[4:5].isalpha():
+            return False
+        if not reg[5:9].isdigit():
+            return False
+    else:
+        if not reg[4:6].isalpha():
+            return False
+        if not reg[6:10].isdigit():
+            return False
+    return True
+
+
+def format_registration(reg):
+    if not is_valid(reg):
+        return "INVALID"
+    return reg[0:2] + " " + reg[2:4] + " " + reg[4:-4] + " " + reg[-4:]
+
+
+def q3():
+    print("\n" + "=" * 65)
+    print("Q3 – VEHICLE REGISTRATION VALIDATOR")
+    print("=" * 65)
+    samples = [
+        "tn 09 ab 1234",
+        "KA-01-M-0007",
+        "TN9AB1234",
+        "TN 22 1234 AB",
+        "mh 12 xy 9876",
+        "DL-03-C-4567",
+    ]
+    print("Predictions: first, second, fifth and sixth are valid; third and fourth invalid.")
+    for raw in samples:
+        reg = normalise(raw)
+        status = "valid" if is_valid(reg) else "INVALID"
+        print(f"{raw:15} -> {reg:11} {status}")
+        if is_valid(reg):
+            print("  Receipt:", format_registration(reg))
+
+    print("Strings are immutable: their characters cannot be changed in place.")
+    text = "tn09ab1234"
+    upper_text = text.upper()
+    print("text =", text, "| text.upper() =", upper_text,
+          "| original unchanged =", text == "tn09ab1234")
+    nine = "TN09AB123"
+    ten = "TN09AB1234"
+    print("9-char s[-4:] =", nine[-4:], "| s[4:-4] =", nine[4:-4])
+    print("10-char s[-4:] =", ten[-4:], "| s[4:-4] =", ten[4:-4])
+    print("Slicing creates new strings; it does not modify the original.")
+    print("Complexity: normalisation and validation are O(L) time; O(L) for new strings.")
+
+
+# ============================================================
+# Q4 – BUILDING LONG TEXT
+# ============================================================
+
+def build_plus(parts):
+    text = ""
+    for part in parts:
+        text += part + ";"
+    return text
+
+
+def build_join(parts):
+    return ";".join(parts) + ";"
+
+
+def build_fstring(parts):
+    result = []
+    for part in parts:
+        result.append(f"{part};")
+    return "".join(result)
+
+
+def measure_builder(builder, items, repeats=3):
+    durations = []
+    result = None
+    for _ in range(repeats):
+        start = time.perf_counter()
+        result = builder(items)
+        durations.append(time.perf_counter() - start)
+    return result, sum(durations) / len(durations), durations
+
+
+def q4():
+    print("\n" + "=" * 65)
+    print("Q4 – STRING BUILDING PERFORMANCE")
+    print("=" * 65)
+    for count in (1_000, 10_000, 200_000):
+        items = [f"Item{i}:Rs{i % 50}" for i in range(count)]
+        plus_text, plus_avg, plus_runs = measure_builder(build_plus, items)
+        join_text, join_avg, join_runs = measure_builder(build_join, items)
+        f_text, f_avg, f_runs = measure_builder(build_fstring, items)
+        print(f"\nItems: {count:,}; same output: {plus_text == join_text == f_text}")
+        print(f"+= average: {plus_avg:.6f}s runs={ [round(x, 6) for x in plus_runs] }")
+        print(f"join average: {join_avg:.6f}s runs={ [round(x, 6) for x in join_runs] }")
+        print(f"f-string/list average: {f_avg:.6f}s runs={ [round(x, 6) for x in f_runs] }")
+    print("join is recommended because it joins parts in one operation.")
+    print("Repeated += may copy growing strings repeatedly (up to O(n^2) work),")
+    print("although CPython can optimise some += patterns.")
+    print("join: O(total characters) time and O(total output) memory.")
+    print("Writing directly to a file or using io.StringIO avoids holding every")
+    print("piece plus the final combined string in memory.")
+
+
+# ============================================================
+# Q5 – FUNCTIONS, PARAMETERS AND SCOPE
+# ============================================================
+
+def add_item_buggy(item, order=[]):
+    order.append(item)
+    return order
+
+
+def add_item(item, order=None):
+    if order is None:
+        order = []
+    order.append(item)
+    return order
+
+
+def calculate_bill(amount, gst_rate=0.05):
+    gst = amount * gst_rate
+    total = amount + gst
+    return total, gst
+
+
+global_count = 0
+
+
+def demonstrate_global():
+    global global_count
+    global_count += 1
+    return global_count
+
+
+def make_counter():
+    count = 0
+    def increment():
+        nonlocal count
+        count += 1
+        return count
+    return increment
+
+
+def make_order():
+    order = []
+    def add(item):
+        order.append(item)
+        return order
+    return add
+
+
+def q5():
+    print("\n" + "=" * 65)
+    print("Q5 – FUNCTIONS, PARAMETERS AND SCOPE")
+    print("=" * 65)
+    print("Buggy calls:", add_item_buggy("Tea"), add_item_buggy("Vada"))
+    print("Correct calls:", add_item("Tea"), add_item("Vada"))
+    print("Buggy function defaults:", add_item_buggy.__defaults__)
+    print("The defaults tuple contains the same list reused by every call.")
+    customers = [
+        add_item("Tea"),
+        add_item("Vada"),
+        add_item("Coffee"),
+    ]
+    print("Three independent customer orders:", customers)
+    print("Bill total and GST:", calculate_bill(100, gst_rate=0.05))
+    print("Global example:", demonstrate_global())
+    counter = make_counter()
+    print("Nonlocal closure counter:", counter(), counter())
+    order_adder = make_order()
+    print("Closure order:", order_adder("Idli"), order_adder("Dosa"))
+    print("Positional: short/common arguments; keyword: clarity; default: optional value.")
+    print("A function can return multiple values as a tuple.")
+    print("Local exists inside a function; global is module-level; nonlocal")
+    print("refers to a name in the enclosing function. Avoid globals where possible.")
+    print("Each customer order uses O(1) append time per item and O(m) space for m items.")
+
+
+# ============================================================
+# Q6 – RECURSION AND ITS LIMITS
+# ============================================================
+
+naive_calls = 0
+
+
+def ways_naive(n):
+    global naive_calls
+    naive_calls += 1
+    if n <= 1:
+        return 1
+    return ways_naive(n - 1) + ways_naive(n - 2)
+
+
+memo_calls = 0
+
+
+@lru_cache(maxsize=None)
+def ways_memo(n):
+    global memo_calls
+    memo_calls += 1
+    if n <= 1:
+        return 1
+    return ways_memo(n - 1) + ways_memo(n - 2)
+
+
+def ways_loop(n):
+    if n <= 1:
+        return 1
+    previous, current = 1, 1
+    for _ in range(2, n + 1):
+        previous, current = current, previous + current
+    return current
+
+
+def q6():
+    global naive_calls, memo_calls
+    print("\n" + "=" * 65)
+    print("Q6 – CLIMBING TEMPLE STEPS")
+    print("=" * 65)
+    print("Hand-check answers:")
+    print({n: ways_loop(n) for n in range(1, 7)})
+    print("Call tree for n=5 (repeated branches are shown):")
+    print("ways(5)")
+    print("├─ ways(4) -> ways(3), ways(2)")
+    print("│  ├─ ways(3) -> ways(2), ways(1)")
+    print("│  └─ ways(2) -> ways(1), ways(0)")
+    print("└─ ways(3) -> ways(2), ways(1)")
+    print("Plain recursion recalculates the same smaller values.")
+    for n in (10, 20, 25, 30):
+        naive_calls = 0
+        naive_answer = ways_naive(n)
+        memo_calls = 0
+        ways_memo.cache_clear()
+        memo_answer = ways_memo(n)
+        print(f"n={n}: naive calls={naive_calls:,}; memo calls={memo_calls}; "
+              f"answers match={naive_answer == memo_answer}")
+    print("Recursion limit:", sys.getrecursionlimit())
+    try:
+        print("Memoised n=1000:", ways_memo(1000))
+    except RecursionError as error:
+        print("Memoised n=1000 raised:", type(error).__name__)
+        print("Memoisation removes repeated calculations but still uses recursive stack.")
+    print("Loop n=1000 has", len(str(ways_loop(1000))), "digits.")
+    print("Complexity: plain recursion O(phi^n) time; memoisation O(n) time")
+    print("and O(n) cache/stack; loop O(n) time and O(1) extra space.")
+    print("Deployment choice: use the loop for n=1000; it avoids recursion depth limits.")
+
+
+# ============================================================
+# Q7 – DIAGNOSE, REDESIGN AND VALIDATE
+# Selected limitation: Q4 repeated string concatenation.
+# ============================================================
+
+def q7():
+    print("\n" + "=" * 65)
+    print("Q7 – DESIGN CHALLENGE: REDESIGN Q4 STRING BUILDING")
+    print("=" * 65)
+    print("A. Diagnosis: += repeatedly grows the output string. Large statements")
+    print("make the amount of copied text grow; the 200,000-line test is the key case.")
+    print("B. Objective: produce identical output while reducing average build time.")
+    print("C. Redesign: collect pieces and join once. It uses memory for the list")
+    print("and final string, trading extra temporary storage for fewer copies.")
+    print("Pseudocode: parts = []; append each line; return separator.join(parts).")
+    print("D. Prediction: join will be faster for large inputs and produce identical text.")
+    print("E. Validation (same input; three runs each):")
+    for count in (1_000, 10_000, 200_000):
+        data = [f"Call{i}:Rs{i % 50}" for i in range(count)]
+        original, old_avg, _ = measure_builder(build_plus, data)
+        redesigned, new_avg, _ = measure_builder(build_join, data)
+        ratio = old_avg / new_avg if new_avg else float("inf")
+        print(f"{count:>7,} lines | identical={original == redesigned} | "
+              f"original += {old_avg:.6f}s | redesigned join {new_avg:.6f}s | "
+              f"speed ratio={ratio:.2f}x")
+    print("F. Evaluation: the objective is achieved if outputs match and join is faster.")
+    print("The list needs O(n) references plus output memory. For small strings or")
+    print("small workloads, += may be simpler and its CPython optimisation may reduce")
+    print("the difference. For large statement generation, join is the clearer choice.")
+
+
+def main():
+    q1()
+    q2()
+    q3()
+    q4()
+    q5()
+    q6()
+    q7()
+    print("\nAll Q1–Q7 demonstrations completed.")
+
+
+if __name__ == "__main__":
+    main()
