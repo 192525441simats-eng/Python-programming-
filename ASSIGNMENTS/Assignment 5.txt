@@ -1,0 +1,908 @@
+"""
+ASSIGNMENT 5 – AIR QUALITY DATA ENGINEERING AND CITIZEN COMPLAINTS
+Complete Python implementation for Part A design support and Part B experiments.
+
+Requirements:
+    Python 3
+    Optional: pandas and matplotlib for their comparison/plots.
+
+Install optional libraries:
+    pip install pandas matplotlib
+
+Run the basic demonstrations:
+    python assignment4_air_quality.py
+
+Run the larger performance experiment (1, 12 and 120 stations):
+    python assignment4_air_quality.py --benchmark
+
+The benchmark generates hourly readings for one year (8,760 readings/station).
+It can take some time, especially for 120 stations.
+"""
+
+import argparse
+import csv
+import cProfile
+import io
+import logging
+import math
+import os
+import re
+import sqlite3
+import statistics
+import tempfile
+import time
+import timeit
+from collections import defaultdict
+from datetime import date, timedelta
+from pathlib import Path
+
+
+# ------------------------------------------------------------
+# COMMON SETTINGS AND LOGGING
+# ------------------------------------------------------------
+
+logging.basicConfig(
+    filename="assignment4_errors.log",
+    level=logging.WARNING,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+LOGGER = logging.getLogger("air_quality")
+
+
+# ------------------------------------------------------------
+# TASK A1 / B1 – DATA ACQUISITION AND CLEANING
+# ------------------------------------------------------------
+
+RAW_SAMPLE = """station,date,pm25,temperature
+Adyar,2026-10-01,48,86
+Adyar,2026-10-02,NA,87
+Adyar,2026-10-03,,88
+Guindy,2026-10-01,95,89
+Guindy,2026-10-02,-5,90
+Guindy,2026-10-03,121,91
+Adyar,2026-10-04,1005,89
+Adyar North,2026-10-04,55,86
+"""
+
+
+def clean_csv_text(text):
+    """
+    Read CSV text and return valid (station, day, pm25, temperature_c) rows.
+
+    Rules:
+    - Empty, NA or non-numeric PM2.5 values are rejected.
+    - PM2.5 values below 0 or above 999 are rejected.
+    - Duplicate (station, day, pm25) records are removed.
+    - Fahrenheit temperature is converted to Celsius when the header says
+      temperature_f. A normal temperature column is assumed to be Celsius.
+    - Dates must use YYYY-MM-DD.
+    """
+    rows = []
+    rejected = []
+    seen = set()
+
+    stream = io.StringIO(text)
+    reader = csv.DictReader(stream)
+
+    required = {"station", "date", "pm25"}
+    if not reader.fieldnames or not required.issubset(
+        {name.strip().lower() for name in reader.fieldnames}
+    ):
+        raise ValueError("CSV is missing one or more required columns")
+
+    fields = {name.strip().lower(): name for name in reader.fieldnames}
+    temp_f = "temperature_f" in fields
+    temp_column = fields.get("temperature_f") or fields.get("temperature")
+
+    for line_number, record in enumerate(reader, start=2):
+        try:
+            station = (record.get(fields["station"]) or "").strip()
+            day_text = (record.get(fields["date"]) or "").strip()
+            pm_text = (record.get(fields["pm25"]) or "").strip()
+
+            if not station:
+                raise ValueError("missing station name")
+            if not day_text:
+                raise ValueError("missing date")
+            date.fromisoformat(day_text)
+
+            if pm_text.upper() in ("", "NA", "N/A", "NULL"):
+                raise ValueError("missing PM2.5 value")
+
+            pm25 = float(pm_text)
+            if not math.isfinite(pm25):
+                raise ValueError("PM2.5 must be a finite number")
+            if pm25 < 0 or pm25 > 999:
+                raise ValueError("PM2.5 outside allowed range 0–999")
+
+            temperature = None
+            if temp_column:
+                temp_text = (record.get(temp_column) or "").strip()
+                if temp_text and temp_text.upper() not in ("NA", "N/A"):
+                    temperature = float(temp_text)
+                    if temp_f:
+                        temperature = (temperature - 32) * 5 / 9
+
+            key = (station.casefold(), day_text, pm25)
+            if key in seen:
+                raise ValueError("duplicate reading")
+            seen.add(key)
+
+            rows.append((station, day_text, pm25, temperature))
+
+        except (ValueError, TypeError, KeyError) as error:
+            rejected.append((line_number, str(error), record))
+            LOGGER.warning("Rejected CSV row %s: %s", line_number, error)
+
+    return rows, rejected
+
+
+def min_max(values):
+    """Return values scaled to 0–1 and rounded to three decimals."""
+    if not values:
+        return []
+    low = min(values)
+    high = max(values)
+    if high == low:
+        return [0.0 for _ in values]
+    return [round((value - low) / (high - low), 3) for value in values]
+
+
+def z_score(values):
+    """Return z-score standardised values (population standard deviation)."""
+    if not values:
+        return []
+    mean_value = statistics.mean(values)
+    std_dev = statistics.pstdev(values)
+    if std_dev == 0:
+        return [0.0 for _ in values]
+    return [round((value - mean_value) / std_dev, 3) for value in values]
+
+
+def read_and_clean_file(filename):
+    """Clean a station CSV file using the same rules as clean_csv_text()."""
+    with open(filename, "r", encoding="utf-8-sig", newline="") as file:
+        return clean_csv_text(file.read())
+
+
+# ------------------------------------------------------------
+# TASK A1 / B1 / B2 – SQLITE DATABASE AND PARAMETERISED QUERIES
+# ------------------------------------------------------------
+
+def create_database(connection):
+    connection.executescript("""
+        PRAGMA foreign_keys = ON;
+
+        CREATE TABLE IF NOT EXISTS stations (
+            station_id INTEGER PRIMARY KEY,
+            station_name TEXT NOT NULL UNIQUE
+        );
+
+        CREATE TABLE IF NOT EXISTS readings (
+            reading_id INTEGER PRIMARY KEY,
+            station_id INTEGER NOT NULL,
+            reading_day TEXT NOT NULL,
+            pm25 REAL NOT NULL CHECK(pm25 >= 0 AND pm25 <= 999),
+            temperature_c REAL,
+            FOREIGN KEY(station_id) REFERENCES stations(station_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_readings_station_day
+        ON readings(station_id, reading_day);
+    """)
+    connection.commit()
+
+
+def insert_readings(connection, rows):
+    """Insert rows using one executemany call with placeholders."""
+    station_names = sorted({row[0] for row in rows})
+    connection.executemany(
+        "INSERT OR IGNORE INTO stations(station_name) VALUES (?)",
+        [(name,) for name in station_names]
+    )
+
+    station_ids = {
+        name: station_id
+        for station_id, name in connection.execute(
+            "SELECT station_id, station_name FROM stations"
+        )
+    }
+
+    data = [
+        (station_ids[station], day, pm25, temperature)
+        for station, day, pm25, temperature in rows
+    ]
+
+    connection.executemany("""
+        INSERT INTO readings
+            (station_id, reading_day, pm25, temperature_c)
+        VALUES (?, ?, ?, ?)
+    """, data)
+    connection.commit()
+
+
+def station_average(connection, station_name, start_day=None, end_day=None):
+    """Safe station average query; user input is always a ? parameter."""
+    query = """
+        SELECT AVG(r.pm25)
+        FROM readings AS r
+        JOIN stations AS s ON s.station_id = r.station_id
+        WHERE s.station_name = ?
+    """
+    params = [station_name]
+
+    if start_day:
+        query += " AND r.reading_day >= ?"
+        params.append(start_day)
+    if end_day:
+        query += " AND r.reading_day <= ?"
+        params.append(end_day)
+
+    result = connection.execute(query, params).fetchone()
+    return result[0]
+
+
+def daily_summary_sql(connection):
+    """Return station/day min, max, mean and valid reading count."""
+    return connection.execute("""
+        SELECT s.station_name, r.reading_day,
+               MIN(r.pm25), MAX(r.pm25), AVG(r.pm25), COUNT(*)
+        FROM readings AS r
+        JOIN stations AS s ON s.station_id = r.station_id
+        GROUP BY s.station_name, r.reading_day
+        ORDER BY s.station_name, r.reading_day
+    """).fetchall()
+
+
+def compare_sql_injection(connection, station_name):
+    """Demonstrate unsafe string construction versus safe placeholders."""
+    unsafe_sql = (
+        "SELECT COUNT(*) FROM readings r JOIN stations s "
+        "ON s.station_id = r.station_id "
+        f"WHERE s.station_name = '{station_name}'"
+    )
+    unsafe_result = connection.execute(unsafe_sql).fetchone()[0]
+
+    safe_result = connection.execute("""
+        SELECT COUNT(*)
+        FROM readings r JOIN stations s ON s.station_id = r.station_id
+        WHERE s.station_name = ?
+    """, (station_name,)).fetchone()[0]
+
+    return unsafe_result, safe_result
+
+
+# ------------------------------------------------------------
+# TASK A3 / B1 – CHARTS
+# ------------------------------------------------------------
+
+def create_charts(rows, output_folder="assignment4_charts"):
+    """
+    Create line, bar, scatter, and hour histogram charts.
+    rows format: (station, date, pm25, temperature_c).
+    Matplotlib is optional.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("Matplotlib not installed; skipping charts.")
+        return
+
+    if not rows:
+        print("No rows available for charts.")
+        return
+
+    output = Path(output_folder)
+    output.mkdir(parents=True, exist_ok=True)
+
+    # 1. Line chart: PM2.5 trend over time
+    by_day = defaultdict(list)
+    by_station = defaultdict(list)
+    for station, day, pm25, temp in rows:
+        by_day[day].append(pm25)
+        by_station[station].append(pm25)
+
+    days = sorted(by_day)
+    daily_means = [statistics.mean(by_day[day]) for day in days]
+    plt.figure()
+    plt.plot(days, daily_means, marker="o")
+    plt.title("Daily PM2.5 Trend")
+    plt.xlabel("Date")
+    plt.ylabel("Mean PM2.5")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(output / "pm25_trend.png")
+    plt.close()
+
+    # 2. Bar chart: compare station means
+    names = sorted(by_station)
+    means = [statistics.mean(by_station[name]) for name in names]
+    plt.figure()
+    plt.bar(names, means)
+    plt.title("Average PM2.5 by Station")
+    plt.xlabel("Station")
+    plt.ylabel("Mean PM2.5")
+    plt.tight_layout()
+    plt.savefig(output / "station_comparison.png")
+    plt.close()
+
+    # 3. Scatter chart: temperature against PM2.5
+    scatter_rows = [
+        (temp, pm25) for _, _, pm25, temp in rows if temp is not None
+    ]
+    if scatter_rows:
+        plt.figure()
+        plt.scatter(
+            [item[0] for item in scatter_rows],
+            [item[1] for item in scatter_rows]
+        )
+        plt.title("Temperature and PM2.5 Relationship")
+        plt.xlabel("Temperature (°C)")
+        plt.ylabel("PM2.5")
+        plt.tight_layout()
+        plt.savefig(output / "temperature_vs_pm25.png")
+        plt.close()
+
+    # 4. Histogram: hours with worst air, if timestamp data is available.
+    # Daily sample data has no hour component, so this chart is not fabricated.
+    print("Charts saved in:", output.resolve())
+    print("Hourly histogram requires a timestamp/hour column in the source data.")
+
+
+# ------------------------------------------------------------
+# TASK A4 – DEBUGGING AND PROFILING HELPERS
+# ------------------------------------------------------------
+
+def validate_pm25(value):
+    assert isinstance(value, (int, float)), "PM2.5 must be numeric"
+    assert math.isfinite(value), "PM2.5 must be finite"
+    assert 0 <= value <= 999, "PM2.5 outside accepted range"
+    return value
+
+
+def profile_cleaning(text):
+    profiler = cProfile.Profile()
+    profiler.enable()
+    rows, rejected = clean_csv_text(text)
+    profiler.disable()
+    profiler.print_stats(sort="cumtime")
+    return rows, rejected
+
+
+def time_cleaning(text, repeats=5):
+    start = time.perf_counter()
+    clean_csv_text(text)
+    elapsed = time.perf_counter() - start
+    print(f"time.perf_counter: {elapsed:.6f} seconds")
+
+    try:
+        duration = timeit.timeit(
+            lambda: clean_csv_text(text),
+            number=repeats
+        )
+        print(
+            f"timeit: {duration / repeats:.6f} seconds per run "
+            f"({repeats} runs)"
+        )
+    except Exception as error:
+        print("timeit could not run:", error)
+
+
+# ------------------------------------------------------------
+# TASK A5 / B4 – SENTIMENT SCORER AND EXTRACTIVE SUMMARISER
+# ------------------------------------------------------------
+
+POSITIVE = {"good", "clean", "fast", "helpful", "improved"}
+NEGATIVE = {"bad", "dirty", "slow", "rude", "smoke", "broken"}
+NEGATORS = {"not", "never", "no"}
+
+STOP_WORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "and", "or",
+    "to", "of", "in", "on", "for", "it", "this", "that", "from",
+    "with", "my", "our", "we", "i", "they", "you", "at", "as"
+}
+
+
+def score(text):
+    """Lexicon sentiment: +/- 1 per known word; preceding negator flips sign."""
+    words = re.findall(r"[a-z']+", text.lower())
+    total = 0
+
+    for index, word in enumerate(words):
+        value = 1 if word in POSITIVE else -1 if word in NEGATIVE else 0
+
+        if index > 0 and words[index - 1] in NEGATORS:
+            value *= -1
+
+        total += value
+
+    return total
+
+
+def sentiment_label(text):
+    value = score(text)
+    if value > 0:
+        return "positive"
+    if value < 0:
+        return "negative"
+    return "neutral"
+
+
+def important_words(text):
+    words = re.findall(r"[a-z']+", text.lower())
+    return [
+        word for word in words
+        if word not in STOP_WORDS and len(word) > 2
+    ]
+
+
+def extractive_summary(text, max_sentences=2):
+    """Select sentences with the highest frequency of important words."""
+    sentences = [
+        item.strip()
+        for item in re.split(r"(?<=[.!?])\s+", text.strip())
+        if item.strip()
+    ]
+
+    if not sentences:
+        return ""
+
+    frequency = defaultdict(int)
+    for sentence in sentences:
+        for word in important_words(sentence):
+            frequency[word] += 1
+
+    scored = []
+    for position, sentence in enumerate(sentences):
+        words = important_words(sentence)
+        sentence_score = sum(frequency[word] for word in words)
+        scored.append((sentence_score, -position, sentence))
+
+    selected = sorted(
+        scored, key=lambda item: (item[0], item[1]), reverse=True
+    )[:max_sentences]
+
+    # Keep original sentence order in the final summary.
+    selected_sentences = {item[2] for item in selected}
+    return " ".join(
+        sentence for sentence in sentences
+        if sentence in selected_sentences
+    )
+
+
+def chatbot(question, connection):
+    """Small rule-based citizen chatbot querying the SQLite database."""
+    text = question.lower()
+    station_match = re.search(
+        r"\b(?:in|at|for)\s+([a-z][a-z0-9 '_-]*?)"
+        r"(?:\s+today|\s+on\s+\d{4}-\d{2}-\d{2}|\?|$)",
+        text
+    )
+
+    if "pm2.5" not in text and "pm25" not in text:
+        return "Please ask about PM2.5 readings."
+
+    if not station_match:
+        return "Please mention a station, for example: PM2.5 in Adyar today?"
+
+    station = station_match.group(1).strip().title()
+    value = station_average(connection, station)
+
+    if value is None:
+        return f"No PM2.5 data found for {station}."
+
+    return f"Average PM2.5 for {station} is {value:.2f}."
+
+
+# ------------------------------------------------------------
+# TASK B1 – SMALL CLEANING TEST AND BEFORE/AFTER OUTPUT
+# ------------------------------------------------------------
+
+def demo_cleaning_and_database():
+    print("\n========== B1: CLEANING PIPELINE ==========")
+    print("RAW INPUT:")
+    print(RAW_SAMPLE)
+
+    clean_rows, rejected = clean_csv_text(RAW_SAMPLE)
+    print("CLEANED ROWS:")
+    for row in clean_rows:
+        print(row)
+
+    print("REJECTED ROWS:")
+    for item in rejected:
+        print(item)
+
+    values = [row[2] for row in clean_rows]
+    print("Min-max values:", min_max(values))
+    print("Z-score values:", z_score(values))
+
+    connection = sqlite3.connect(":memory:")
+    create_database(connection)
+    insert_readings(connection, clean_rows)
+
+    print("\nSQL station averages:")
+    for station in ("Adyar", "Guindy"):
+        print(station, station_average(connection, station))
+
+    print("\nSQL daily summary:")
+    for row in daily_summary_sql(connection):
+        print(row)
+
+    # Demonstrate safe handling of a quote in a station name.
+    print("\nQuote/injection test:")
+    print(
+        "unsafe count, safe count:",
+        compare_sql_injection(connection, "Adyar' OR '1'='1")
+    )
+
+    create_charts(clean_rows)
+    connection.close()
+
+
+# ------------------------------------------------------------
+# TASK B2 – ADVERSARIAL INPUTS
+# ------------------------------------------------------------
+
+def demo_adversarial_inputs():
+    print("\n========== B2: ADVERSARIAL INPUTS ==========")
+
+    tests = {
+        "missing column": "station,date\nAdyar,2026-10-01\n",
+        "wrong delimiter": "station;date;pm25\nAdyar;2026-10-01;48\n",
+        "empty file": "",
+    }
+
+    for label, text in tests.items():
+        try:
+            result, errors = clean_csv_text(text)
+            print(label, "->", result, errors)
+        except Exception as error:
+            print(label, "->", type(error).__name__, str(error))
+
+    # Different encoding: bytes that are not valid UTF-8.
+    with tempfile.NamedTemporaryFile(delete=False) as file:
+        file.write(b"station,date,pm25\nAdyar,\xff,48\n")
+        bad_encoding_path = file.name
+
+    try:
+        try:
+            read_and_clean_file(bad_encoding_path)
+        except UnicodeDecodeError as error:
+            print("different encoding ->", type(error).__name__)
+    finally:
+        os.remove(bad_encoding_path)
+
+    # Unsafe SQL string versus parameterised SQL.
+    connection = sqlite3.connect(":memory:")
+    create_database(connection)
+    insert_readings(connection, [
+        ("Adyar", "2026-10-01", 48.0, None),
+        ("Guindy", "2026-10-01", 95.0, None),
+    ])
+
+    attack = "Adyar' OR '1'='1"
+    unsafe_count, safe_count = compare_sql_injection(connection, attack)
+    print("SQL injection unsafe count:", unsafe_count)
+    print("SQL injection safe count:", safe_count)
+    connection.close()
+
+    # Sentiment edge cases.
+    print("\nSentiment adversarial examples:")
+    for sentence in (
+        "Not bad, but the service was slow.",
+        "The air is not not good.",
+        "Great, another day breathing smoke!",
+        "The road is clean but the air is dirty."
+    ):
+        print(sentiment_label(sentence), "|", sentence)
+
+
+# ------------------------------------------------------------
+# TASK B3 – PYTHON, PANDAS AND SQLITE COMPARISON
+# ------------------------------------------------------------
+
+def daily_means_python(rows):
+    """Plain Python one-pass accumulation; rows=(station, date, pm25)."""
+    totals = defaultdict(float)
+    counts = defaultdict(int)
+
+    for station, day, pm25 in rows:
+        key = (station, day)
+        totals[key] += pm25
+        counts[key] += 1
+
+    return {
+        key: totals[key] / counts[key]
+        for key in totals
+    }
+
+
+def daily_means_pandas(rows):
+    """Pandas groupby implementation. Raises ImportError if pandas is absent."""
+    import pandas as pd
+
+    frame = pd.DataFrame(rows, columns=["station", "day", "pm25"])
+    grouped = frame.groupby(["station", "day"])["pm25"].mean()
+    return grouped.to_dict()
+
+
+def daily_means_sql(rows):
+    connection = sqlite3.connect(":memory:")
+    connection.execute("""
+        CREATE TABLE readings (
+            station TEXT, day TEXT, pm25 REAL
+        )
+    """)
+    connection.executemany(
+        "INSERT INTO readings VALUES (?, ?, ?)", rows
+    )
+    connection.execute(
+        "CREATE INDEX idx_station_day ON readings(station, day)"
+    )
+    result = {
+        (station, day): mean
+        for station, day, mean in connection.execute("""
+            SELECT station, day, AVG(pm25)
+            FROM readings
+            GROUP BY station, day
+        """)
+    }
+    connection.close()
+    return result
+
+
+def generate_hourly_data(station_count, seed=17):
+    """Generate 8,760 hourly rows per station for a non-leap year."""
+    import random
+    random.seed(seed)
+
+    rows = []
+    start = date(2025, 1, 1)
+
+    for station_number in range(station_count):
+        station = f"Station_{station_number + 1:03d}"
+
+        for hour_number in range(8760):
+            day = start + timedelta(days=hour_number // 24)
+            pm25 = round(random.uniform(5, 180), 2)
+            rows.append((station, day.isoformat(), pm25))
+
+    return rows
+
+
+def benchmark_one_size(station_count):
+    rows = generate_hourly_data(station_count)
+    print(f"\n--- {station_count} station(s), {len(rows):,} readings ---")
+
+    start = time.perf_counter()
+    python_result = daily_means_python(rows)
+    python_time = time.perf_counter() - start
+    print(f"Python loops: {python_time:.4f} sec")
+
+    try:
+        start = time.perf_counter()
+        pandas_result = daily_means_pandas(rows)
+        pandas_time = time.perf_counter() - start
+        print(f"Pandas groupby: {pandas_time:.4f} sec")
+        print("Pandas agrees:", compare_mean_dicts(python_result, pandas_result))
+    except ImportError:
+        print("Pandas groupby: skipped (install pandas)")
+
+    start = time.perf_counter()
+    sql_result = daily_means_sql(rows)
+    sql_time = time.perf_counter() - start
+    print(f"SQLite GROUP BY: {sql_time:.4f} sec")
+    print("SQL agrees:", compare_mean_dicts(python_result, sql_result))
+
+    # Profile Python implementation.
+    profiler = cProfile.Profile()
+    profiler.enable()
+    daily_means_python(rows)
+    profiler.disable()
+    print("cProfile – highest cumulative time:")
+    profiler.print_stats(sort="cumtime")
+
+    return rows
+
+
+def compare_mean_dicts(first, second, tolerance=1e-9):
+    if first.keys() != second.keys():
+        return False
+    return all(
+        abs(first[key] - second[key]) < tolerance
+        for key in first
+    )
+
+
+def run_benchmarks():
+    print("\n========== B3: PERFORMANCE EXPERIMENT ==========")
+    for count in (1, 12, 120):
+        benchmark_one_size(count)
+
+
+# ------------------------------------------------------------
+# TASK B4 – 50 COMPLAINTS, AGREEMENT, INDEX TEST
+# ------------------------------------------------------------
+
+SAMPLE_COMPLAINTS = [
+    "The air is clean and the roads are good.",
+    "Smoke is bad near the factory.",
+    "The bus service is slow and dirty.",
+    "The staff were helpful and the response was fast.",
+    "The road is broken and the area is dirty.",
+    "The air quality improved this week.",
+    "There is smoke near our school every morning.",
+    "The service is not good.",
+    "The park is clean and helpful staff are present.",
+    "The road repair is slow.",
+    "Air is bad and smoke is everywhere.",
+    "The bus was fast and the driver was helpful.",
+    "The street is dirty after the market closes.",
+    "The new system improved the service.",
+    "The complaint response was not helpful.",
+    "The air is clean near the lake.",
+    "The factory smoke makes the air bad.",
+    "The road is good but the bus is slow.",
+    "The workers were rude and the road is broken.",
+    "The area looks clean today.",
+    "Not good, there is smoke near the station.",
+    "The service is never good.",
+    "The air is not bad today.",
+    "The road is clean but traffic is slow.",
+    "The staff were not rude and were helpful.",
+    "Smoke is making the neighbourhood dirty.",
+    "The new bus service is fast.",
+    "The road is broken and repair is slow.",
+    "The area is clean and the response is good.",
+    "The air quality is bad near the main road.",
+    "The service is helpful but the bus is slow.",
+    "There is no smoke today and the air is clean.",
+    "The staff are rude and not helpful.",
+    "The new cleaning work improved the street.",
+    "The air is dirty because of smoke.",
+    "The bus is not slow today.",
+    "The complaint system is good and fast.",
+    "The road is broken but the response was helpful.",
+    "The air is clean, but the traffic is bad.",
+    "The factory is producing smoke again.",
+    "The service is not bad and staff are helpful.",
+    "The street is dirty and the bins are broken.",
+    "The new road is good.",
+    "The response was slow but the issue is improved.",
+    "The smoke is bad near the hospital.",
+    "The bus service is fast and clean.",
+    "The staff were not helpful and were rude.",
+    "The air is good today.",
+    "The road is broken and dirty.",
+    "The complaint response is helpful."
+]
+
+
+def manual_label_for_demo(text):
+    """
+    Example human-review labels for a reproducible agreement demonstration.
+    In a real assignment, replace these with your own manually checked labels.
+    """
+    lowered = text.lower()
+    if "not bad" in lowered or "not slow" in lowered:
+        return "positive"
+    if "not helpful" in lowered or "not good" in lowered:
+        return "negative"
+    return sentiment_label(text)
+
+
+def evaluate_complaints(complaints=SAMPLE_COMPLAINTS):
+    matches = 0
+    comparisons = []
+
+    for complaint in complaints:
+        predicted = sentiment_label(complaint)
+        human_label = manual_label_for_demo(complaint)
+        if predicted == human_label:
+            matches += 1
+        comparisons.append((predicted, human_label, complaint))
+
+    agreement = matches / len(complaints) * 100 if complaints else 0
+
+    print("\n========== B4: COMPLAINT ANALYSIS ==========")
+    print("Number of complaints:", len(complaints))
+    print(f"Agreement with demo review labels: {matches}/{len(complaints)}")
+    print(f"Agreement percentage: {agreement:.1f}%")
+
+    for predicted, human, complaint in comparisons:
+        if predicted != human:
+            print("Disagreement:", predicted, "/", human, "|", complaint)
+
+    print("\nExtractive summary:")
+    print(extractive_summary(" ".join(complaints), max_sentences=5))
+
+    return agreement
+
+
+def index_timing_experiment():
+    """Compare a station/day query before and after adding a composite index."""
+    connection = sqlite3.connect(":memory:")
+    connection.execute("""
+        CREATE TABLE readings (
+            station TEXT, day TEXT, pm25 REAL
+        )
+    """)
+
+    rows = []
+    for station_number in range(100):
+        station = f"Station_{station_number:03d}"
+        for day_number in range(365):
+            day = (date(2025, 1, 1) + timedelta(days=day_number)).isoformat()
+            for reading_number in range(4):
+                rows.append((station, day, 20.0 + reading_number))
+
+    connection.executemany("INSERT INTO readings VALUES (?, ?, ?)", rows)
+    connection.commit()
+
+    query = """
+        SELECT AVG(pm25) FROM readings
+        WHERE station = ? AND day = ?
+    """
+    parameters = ("Station_050", "2025-07-01")
+
+    start = time.perf_counter()
+    for _ in range(100):
+        connection.execute(query, parameters).fetchone()
+    without_index = time.perf_counter() - start
+
+    connection.execute(
+        "CREATE INDEX idx_station_day ON readings(station, day)"
+    )
+    connection.commit()
+
+    start = time.perf_counter()
+    for _ in range(100):
+        connection.execute(query, parameters).fetchone()
+    with_index = time.perf_counter() - start
+
+    print("\nIndex timing (100 repeated queries):")
+    print(f"Without index: {without_index:.6f} sec")
+    print(f"With index:    {with_index:.6f} sec")
+    if with_index > 0:
+        print(f"Speed-up:      {without_index / with_index:.2f}x")
+
+    connection.close()
+
+
+# ------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Assignment 4 air-quality data engineering program"
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run larger 1, 12 and 120 station performance experiments"
+    )
+    args = parser.parse_args()
+
+    print("ASSIGNMENT 4 – AIR QUALITY DATA ENGINEERING")
+    demo_cleaning_and_database()
+    demo_adversarial_inputs()
+    time_cleaning(RAW_SAMPLE)
+    profile_cleaning(RAW_SAMPLE)
+    evaluate_complaints()
+    index_timing_experiment()
+
+    if args.benchmark:
+        run_benchmarks()
+    else:
+        print(
+            "\nTo run the larger B3 benchmark, use:\n"
+            "python assignment4_air_quality.py --benchmark"
+        )
+
+    print("\nProgram completed.")
+    print("Check assignment4_errors.log and assignment4_charts/ for outputs.")
+
+
+if __name__ == "__main__":
+    main()
